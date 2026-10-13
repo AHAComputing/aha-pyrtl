@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aha-pyrtl"
+version = "0.12.0+aha.1"
+description = "AHAComputing fork of PyRTL with deterministic hierarchy and typed interfaces"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE.md"}
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+blif = ["pyparsing"]
+svg = ["graphviz"]
+
+[tool.setuptools.packages.find]
+include = ["pyrtl", "pyrtl.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

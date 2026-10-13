@@ -1,0 +1,19 @@
+{
+  "schema": "aha.public-source-snapshot.v1",
+  "repository": "AHAComputing/aha-pyrtl",
+  "source_repository": "al3x3n0/CoreForge",
+  "source_commit": "f36958f3c8bdf6f17fa679f57f8e3d7f921bfd41",
+  "history": "clean snapshot; original private history retained",
+  "scope": "Committed source only; pending local changes excluded",
+  "source_subtree": "third_party/pyrtl/",
+  "regression_source_paths": [
+    "aha/tests/test_pyrtl_bundle.py",
+    "aha/tests/test_pyrtl_hierarchy.py",
+    "aha/tests/test_pyrtl_deterministic_naming.py",
+    "aha/tests/test_pyrtl_systemverilog.py",
+    "aha/tests/test_pyrtl_sram.py",
+    "aha/tests/test_pyrtl_power.py",
+    "aha/tests/test_pyrtl_reset_value.py",
+    "aha/tests/test_pyrtl_modular.py"
+  ]
+}
