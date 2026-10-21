@@ -687,30 +687,50 @@ class Block:
         came from set/id-hash iteration and varied across runs). The set of nets yielded
         and the topological validity are unchanged; only the order is now canonical.
         """
+        yield from self.iter_topological(canonical=True)
+
+    def iter_topological(self, *, canonical: bool = True):
+        """Iterate in topological order, optionally skipping canonical sorting.
+
+        ``canonical=True`` is the reproducible emission order used by the public
+        block iterator. ``canonical=False`` preserves the same dependency order
+        and loop detection in linear time, but permits arbitrary ordering among
+        simultaneously ready nets. It is intended for ephemeral simulation
+        code whose observable semantics do not depend on statement order.
+        """
         import heapq
+        from collections import deque
 
         from pyrtl.wire import Const, Input, Register
 
         _, dest_dict = self.net_connections()
-        # canonical rank per net; pushing the int rank (never the LogicNet) into the heap
-        # keeps the order canonical AND avoids LogicNet comparison (which is disabled).
-        ordered = sorted(self.logic, key=_net_sort_key)
-        rank = {net: i for i, net in enumerate(ordered)}
+        if canonical:
+            ordered = sorted(self.logic, key=_net_sort_key)
+            rank = {net: i for i, net in enumerate(ordered)}
+        else:
+            ordered = tuple(self.logic)
+            rank = None
 
         # Inputs, Consts and Register *outputs* are "produced" from the start (a
         # register's output breaks its own cycle, exactly as upstream pre-cleared them).
         cleared = set(self.wirevector_subset((Input, Const, Register)))
         indeg = {}
-        heap = []
+        ready = [] if canonical else deque()
         for net in ordered:
             pending = len({a for a in net.args if a not in cleared})
             indeg[net] = pending
             if pending == 0:
-                heapq.heappush(heap, rank[net])
+                if canonical:
+                    heapq.heappush(ready, rank[net])
+                else:
+                    ready.append(net)
 
         yielded = 0
-        while heap:
-            net = ordered[heapq.heappop(heap)]
+        while ready:
+            if canonical:
+                net = ordered[heapq.heappop(ready)]
+            else:
+                net = ready.popleft()
             yield net
             yielded += 1
             # Register nets ('r') do not propagate: their dest output was pre-cleared.
@@ -721,7 +741,10 @@ class Block:
                         for consumer in dest_dict.get(dest, ()):
                             indeg[consumer] -= 1
                             if indeg[consumer] == 0:
-                                heapq.heappush(heap, rank[consumer])
+                                if canonical:
+                                    heapq.heappush(ready, rank[consumer])
+                                else:
+                                    ready.append(consumer)
 
         if yielded != len(self.logic):
             from pyrtl.helperfuncs import find_and_print_loop

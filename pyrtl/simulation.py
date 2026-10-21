@@ -607,6 +607,7 @@ class FastSimulation:
         block: Block = None,
         code_file: str | None = None,
         skip_sanity_check: bool = False,
+        canonical_order: bool = True,
     ):
         """
         The interfaces for ``FastSimulation`` and :class:`Simulation` are nearly
@@ -630,6 +631,12 @@ class FastSimulation:
             intended only for a block that the caller has just validated, such as the
             result of :meth:`pyrtl.hierarchy.Design.flatten`, which already runs the
             same check. The default remains fail-closed.
+
+        :param canonical_order: Generate statements in canonical deterministic
+            topological order. Set to ``False`` for linear-time initialization of
+            very large ephemeral simulations. This changes only the order among
+            dependency-independent statements, never circuit semantics. The default
+            remains canonical for reproducible generated source.
         """
 
         if memory_value_map is None:
@@ -647,6 +654,7 @@ class FastSimulation:
         self.tracer = tracer
         self.sim_func = None
         self.code_file = code_file
+        self.canonical_order = canonical_order
         self.mems = {}
         self.regs = {}
         self.internal_names = _PythonSanitizer("_fastsim_tmp_")
@@ -943,7 +951,12 @@ class FastSimulation:
                 bit = f"({(1 << split_length) - 1} & ({source} >> {split_start_bit}))"
             return shift(bit, "<<", split_res_start_bit)
 
-        for net in self.block:
+        nets = (
+            self.block
+            if self.canonical_order
+            else self.block.iter_topological(canonical=False)
+        )
+        for net in nets:
             if net.op in simple_func:
                 argvals = (self._arg_varname(arg) for arg in net.args)
                 expr = simple_func[net.op](*argvals)

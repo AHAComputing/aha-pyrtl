@@ -142,7 +142,19 @@ def _clone_module_into_block(
                 cloned_mem = mem_map.get(old_mem)
                 if cloned_mem is None:
                     cloned_mem = old_mem._make_copy(target)
+                    old_clone_name = cloned_mem.name
                     cloned_mem.name = f"{instance_name}_{old_mem.name}"
+                    # ``_make_copy`` registers the memory under its source
+                    # name before the hierarchy scope is applied.  Move that
+                    # exact entry instead of leaving each later instance to
+                    # overwrite the prior clone in ``memblock_by_name``.
+                    if target.memblock_by_name.get(old_clone_name) is cloned_mem:
+                        del target.memblock_by_name[old_clone_name]
+                    if cloned_mem.name in target.memblock_by_name:
+                        raise ValueError(
+                            f"duplicate cloned memory name {cloned_mem.name!r}"
+                        )
+                    target.memblock_by_name[cloned_mem.name] = cloned_mem
                     mem_map[old_mem] = cloned_mem
                 new_param = (cloned_mem.id, cloned_mem)
             new_net = LogicNet(

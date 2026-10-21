@@ -92,8 +92,8 @@ def _compilesim_cache_dir():
         return None
 
 
-def _compilesim_cache_key(csource, gcc_cmd):
-    """SHA-256 of the build signature + the (deterministic) C source."""
+def _compilesim_cache_hasher(gcc_cmd):
+    """Return a SHA-256 seeded with the platform/compiler build signature."""
     sig = "\0".join(
         [
             _CACHE_FORMAT,
@@ -107,6 +107,12 @@ def _compilesim_cache_key(csource, gcc_cmd):
     h = hashlib.sha256()
     h.update(sig.encode("utf-8"))
     h.update(b"\0")
+    return h
+
+
+def _compilesim_cache_key(csource, gcc_cmd):
+    """SHA-256 of the build signature + the (deterministic) C source."""
+    h = _compilesim_cache_hasher(gcc_cmd)
     h.update(csource.encode("utf-8"))
     return h.hexdigest()
 
@@ -446,22 +452,35 @@ class CompiledSimulation:
         """
         if isinstance(wv, (Input, Output)):
             return True
-        for net in self.block.logic:
-            if (
-                net.op == "w"
-                and net.args[0].name == wv.name
-                and isinstance(net.dests[0], Output)
-            ):
-                self._probe_mapping[wv.name] = net.dests[0].name
-                return True
-        return False
+        return wv.name in self._probe_mapping
 
     def _remove_untraceable(self):
         """Remove from the tracer those wires that CompiledSimulation cannot track.
 
         Create _probe_mapping for wires only traceable via probes.
         """
-        self._probe_mapping = {}
+        # Index probes once.  The old implementation searched the complete netlist
+        # from _traceable for every named wire, making startup quadratic and
+        # effectively hanging multi-million-op production designs.
+        probe_outputs = {}
+        probe_candidates = {
+            wire.name
+            for wire in self.tracer.wires_to_track
+            if not isinstance(wire, (Input, Output))
+        }
+        if probe_candidates:
+            for net in self.block.logic:
+                if (
+                    net.op == "w"
+                    and net.args[0].name in probe_candidates
+                    and isinstance(net.dests[0], Output)
+                ):
+                    source_name = net.args[0].name
+                    output_name = net.dests[0].name
+                    previous = probe_outputs.get(source_name)
+                    if previous is None or output_name < previous:
+                        probe_outputs[source_name] = output_name
+        self._probe_mapping = probe_outputs
         wvs = {wv for wv in self.tracer.wires_to_track if self._traceable(wv)}
         self.tracer.wires_to_track = wvs
         self.tracer._wires = {wv.name: wv for wv in wvs}
@@ -486,12 +505,6 @@ class CompiledSimulation:
         temp dir (cheap) and load that; the cache replaces gcc, not the per-instance
         isolation the original temp-dir-per-instance scheme provided.
         """
-        # Generate the C source. This ALSO populates the marshalling maps used by
-        # step()/run(), so it must run even on a cache hit (we just skip the gcc step).
-        lines = []
-        self._create_code(lines.append)
-        csource = "\n".join(lines) + "\n"
-
         if platform.system() == "Darwin":
             shared, march = "-dynamiclib", None
         else:
@@ -502,16 +515,31 @@ class CompiledSimulation:
         gcc_cmd += ["-std=c99", "-m64", shared, "-fPIC"]
 
         cache_dir = _compilesim_cache_dir()
-        cached_so = None
-        if cache_dir is not None:
-            cached_so = path.join(
-                cache_dir, _compilesim_cache_key(csource, gcc_cmd) + ".so"
-            )
-
         # Always build into a private per-instance temp dir -> a unique-inode .so that this
         # instance alone dlopens (isolated globals).
         self._dir = tempfile.mkdtemp()
         inst_so = path.join(self._dir, "pyrtlsim.so")
+        cpath = path.join(self._dir, "pyrtlsim.c")
+
+        # Generate directly into the source file instead of retaining millions of C
+        # fragments plus their joined duplicate in memory.  Hash the exact emitted bytes
+        # as they stream so the content-addressed cache key remains unchanged.  Codegen
+        # also populates the marshalling maps and therefore runs on cache hits.
+        source_hasher = (
+            _compilesim_cache_hasher(gcc_cmd) if cache_dir is not None else None
+        )
+        with open(cpath, "wb") as source_file:
+            def write_line(line):
+                encoded = (line + "\n").encode("utf-8")
+                source_file.write(encoded)
+                if source_hasher is not None:
+                    source_hasher.update(encoded)
+
+            self._create_code(write_line)
+
+        cached_so = None
+        if cache_dir is not None:
+            cached_so = path.join(cache_dir, source_hasher.hexdigest() + ".so")
 
         self._cache_hit = False
         if cached_so is not None and path.exists(cached_so):
@@ -522,15 +550,17 @@ class CompiledSimulation:
                 self._cache_hit = False  # fall through and compile
 
         if not self._cache_hit:
-            cpath = path.join(self._dir, "pyrtlsim.c")
-            with open(cpath, "w") as f:
-                f.write(csource)
             subprocess.check_call(
                 gcc_cmd + [cpath, "-o", inst_so],
                 shell=(platform.system() == "Windows"),
             )
             if cached_so is not None:
                 _install_cached_so(inst_so, cached_so)  # publish for others (best-effort)
+        else:
+            try:
+                os.remove(cpath)
+            except OSError:
+                pass
 
         self._dll = ctypes.CDLL(inst_so)
 
