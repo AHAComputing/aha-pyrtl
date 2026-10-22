@@ -572,13 +572,7 @@ class CompiledSimulation:
         The value being masked is of width `res`. Limb number `pos` of `dest` is being
         assigned to.
         """
-        # Every generated wire must keep the unused bits in its final host limb
-        # clear.  This is required even when ``dest.bitwidth == res``: irregular
-        # concatenations can otherwise leave bits above the logical width set.
-        # Those bits are invisible while the value stands alone, but leak into
-        # the next wider concat (for example XNN's 400-bit product vector nested
-        # below a 9-bit zero point), corrupting real payload bits.
-        if 0 < (dest.bitwidth - 64 * pos) < 64:
+        if (res is None or dest.bitwidth < res) and 0 < (dest.bitwidth - 64 * pos) < 64:
             return f"&0x{(1 << (dest.bitwidth % 64)) - 1:X}"
         return ""
 
@@ -822,10 +816,10 @@ class CompiledSimulation:
                 arg, alimb, astart, asize = curr
                 res.append(f"(({arg}[{alimb}]>>{astart})<<{dpos})")
                 dpos += asize
+                if dpos >= dest.bitwidth - 64 * n:
+                    break
                 if dpos > 64:
                     curr = (arg, alimb, 64 - (dpos - asize), dpos - 64)
-                    break
-                if dpos >= dest.bitwidth - 64 * n:
                     break
                 curr = next(pieces)
                 if dpos == 64:

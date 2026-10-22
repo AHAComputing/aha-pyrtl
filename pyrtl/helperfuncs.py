@@ -7,13 +7,7 @@ import numbers
 import random
 from typing import TYPE_CHECKING, NamedTuple
 
-from pyrtl.core import (
-    Block,
-    _block_name_indexer,
-    _get_debug_mode,
-    _NameIndexer,
-    working_block,
-)
+from pyrtl.core import Block, _get_debug_mode, _NameIndexer, working_block
 from pyrtl.corecircuits import (
     as_wires,
     concat,
@@ -84,8 +78,7 @@ def probe(w: WireVector, name: str | None = None) -> WireVector:
         raise PyrtlError(msg)
 
     if name is None:
-        indexer = _block_name_indexer(w._block, "_aha_probe_idx", "Probe-")
-        name = f"({indexer.make_valid_string()}: {w.name})"
+        name = f"({probeIndexer.make_valid_string()}: {w.name})"
     if _get_debug_mode():
         print("Probe: " + name + " " + get_stack(w))
 
@@ -139,8 +132,9 @@ def rtl_assert(w: WireVector, exp: Exception, block: Block = None) -> Output:
         msg = "assertion conflicts with existing registered assertion"
         raise PyrtlInternalError(msg)
 
-    indexer = _block_name_indexer(block, "_aha_assert_idx", "assertion")
-    assert_wire = Output(bitwidth=1, name=indexer.make_valid_string(), block=block)
+    assert_wire = Output(
+        bitwidth=1, name=assertIndexer.make_valid_string(), block=block
+    )
     assert_wire <<= w
     block.rtl_assert_dict[assert_wire] = exp
     return assert_wire

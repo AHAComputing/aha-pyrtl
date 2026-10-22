@@ -246,12 +246,6 @@ def clone_wire(old_wire, name=None):
 
     if isinstance(old_wire, Const):
         return Const(old_wire.val, old_wire.bitwidth, name=name)
-    if isinstance(old_wire, Register):
-        return Register(
-            old_wire.bitwidth,
-            name=name,
-            reset_value=old_wire.reset_value,
-        )
     return old_wire.__class__(old_wire.bitwidth, name=name)
 
 

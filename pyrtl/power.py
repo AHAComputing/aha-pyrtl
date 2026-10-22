@@ -43,10 +43,8 @@ __all__ = [
     "PowerParams",
     "NetPower",
     "PowerEstimate",
-    "StreamingToggleTrace",
     "count_toggles",
     "estimate_dynamic_power",
-    "estimate_streaming_dynamic_power",
     "simulate_and_estimate_power",
 ]
 
@@ -98,85 +96,6 @@ class PowerEstimate:
     )
 
 
-class StreamingToggleTrace:
-    """Count whole-net toggles online without retaining per-cycle waveforms.
-
-    ``FastSimulation`` normally materializes one Python integer per tracked wire per
-    cycle in a :class:`SimulationTrace`.  That is useful for waveforms but needlessly
-    makes power measurement memory scale as ``O(wires * cycles)``.  This tracer keeps
-    only the previous value and accumulated toggle count for each wire, so memory is
-    ``O(wires)`` while preserving the exact settled-cycle activity used by
-    :func:`estimate_dynamic_power`.
-
-    The object implements the tracer seam consumed by ``Simulation`` and
-    ``FastSimulation``.  It intentionally does not support waveform rendering.
-    """
-
-    def __init__(self, wires_to_track="all", block=None):
-        self.block = working_block(block)
-        if wires_to_track == "all":
-            wires = self.block.wirevector_set
-        elif wires_to_track is None:
-            wires = self.block.wirevector_set
-        else:
-            wires = wires_to_track
-        self.wires_to_track = tuple(
-            sorted(
-                (wire for wire in wires if not isinstance(wire, Const)),
-                key=lambda wire: wire.name,
-            )
-        )
-        if not self.wires_to_track:
-            raise PyrtlError("streaming toggle trace needs at least one non-constant wire")
-        self._wires = {wire.name: wire for wire in self.wires_to_track}
-        # FastSimulation uses the keys of ``trace`` to decide which internal values to
-        # return from its generated function. Values are sentinels, not waveform lists.
-        self.trace = dict.fromkeys(self._wires)
-        self._previous: dict[str, int] = {}
-        self._toggles = dict.fromkeys(self._wires, 0)
-        self._samples = 0
-        self.default_value = 0
-        self.register_value_map = {}
-        self.memory_value_map = {}
-
-    def __len__(self):
-        return self._samples
-
-    @property
-    def cycles(self) -> int:
-        return max(0, self._samples - 1)
-
-    @property
-    def toggle_counts(self) -> dict[str, int]:
-        return dict(self._toggles)
-
-    def _set_initial_values(
-        self, default_value, register_value_map, memory_value_map
-    ):
-        self.default_value = default_value
-        self.register_value_map = register_value_map
-        self.memory_value_map = memory_value_map
-
-    def _record(self, value_for_name):
-        if self._samples == 0:
-            for name in self.trace:
-                self._previous[name] = int(value_for_name(name))
-        else:
-            for name in self.trace:
-                value = int(value_for_name(name))
-                self._toggles[name] += (
-                    value ^ self._previous[name]
-                ).bit_count()
-                self._previous[name] = value
-        self._samples += 1
-
-    def add_step(self, value_map):
-        self._record(lambda name: value_map[self._wires[name]])
-
-    def add_fast_step(self, fastsim):
-        self._record(fastsim.context.__getitem__)
-
-
 def _bit_toggles(values) -> int:
     """Total bit transitions across consecutive cycle samples of one wire."""
     total = 0
@@ -207,84 +126,6 @@ def count_toggles(trace) -> tuple[dict[str, int], int]:
     return toggles, cycles
 
 
-def _estimate_from_toggles(
-    *,
-    toggles: dict[str, int],
-    cycles: int,
-    wires_by_name,
-    block,
-    params: PowerParams,
-    top_k: int,
-) -> PowerEstimate:
-    if cycles <= 0:
-        raise PyrtlError(
-            "trace has fewer than 2 cycles; run the simulation for at least 2 steps "
-            "before estimating power"
-        )
-
-    # fanout per wire, computed once (number of gate-input connections it drives)
-    _, dst_nets = block.net_connections()
-    fanout_of = {
-        w: sum(1 for net in nets for a in net.args if a is w)
-        for w, nets in dst_nets.items()
-    }
-
-    v2 = params.voltage * params.voltage
-    half = 0.5 * 1.0e-15  # fF -> F, and the 1/2 in 1/2 C V^2 per transition
-    energy_j = 0.0
-    nets: list[NetPower] = []
-    total_toggles = 0
-    # Accumulate in sorted-name order: float addition is non-associative, and toggles is
-    # keyed off the (id-hash-ordered) wire set, so an unsorted sum would vary by ULPs
-    # across runs even though the toggle COUNTS are identical.
-    for name, tog in sorted(toggles.items()):
-        total_toggles += tog
-        if tog == 0:
-            continue
-        w = wires_by_name.get(name)
-        if w is None or isinstance(w, Const):
-            continue
-        fo = fanout_of.get(w, 0)
-        cap_bit_ff = params.cap_wire_ff + params.cap_fanout_ff * fo
-        e = half * cap_bit_ff * v2 * tog
-        energy_j += e
-        bw = w.bitwidth or 1
-        nets.append(
-            NetPower(
-                name=name,
-                bitwidth=bw,
-                fanout=fo,
-                toggles=tog,
-                activity=tog / cycles,
-                power_w=e * params.frequency_hz / cycles,
-            )
-        )
-
-    data_power_w = energy_j * params.frequency_hz / cycles
-    register_bits = sum(
-        (w.bitwidth or 1) for w in block.wirevector_subset(Register)
-    )
-    clock_power_w = (
-        register_bits
-        * (params.cap_clock_ff * 1.0e-15)
-        * v2
-        * params.frequency_hz
-    )
-
-    nets.sort(key=lambda n: n.power_w, reverse=True)
-    return PowerEstimate(
-        dynamic_power_w=data_power_w + clock_power_w,
-        data_switching_power_w=data_power_w,
-        clock_power_w=clock_power_w,
-        switching_energy_j=energy_j,
-        cycles=cycles,
-        total_toggles=total_toggles,
-        register_bits=register_bits,
-        params=params,
-        dominant_nets=nets[:top_k],
-    )
-
-
 def estimate_dynamic_power(
     trace,
     block=None,
@@ -303,35 +144,74 @@ def estimate_dynamic_power(
     block = block or getattr(trace, "block", None) or working_block()
 
     toggles, cycles = count_toggles(trace)
-    return _estimate_from_toggles(
-        toggles=toggles,
-        cycles=cycles,
-        wires_by_name=dict(getattr(trace, "_wires", {})),
-        block=block,
-        params=params,
-        top_k=top_k,
+    if cycles <= 0:
+        raise PyrtlError(
+            "trace has fewer than 2 cycles; run the simulation for at least 2 steps "
+            "before estimating power"
+        )
+
+    # name -> WireVector (for bitwidth); the tracer records this mapping for tracked wires
+    wires_by_name = dict(getattr(trace, "_wires", {}))
+
+    # fanout per wire, computed once (number of gate-input connections it drives)
+    _, dst_nets = block.net_connections()
+    fanout_of = {
+        w: sum(1 for net in nets for a in net.args if a is w)
+        for w, nets in dst_nets.items()
+    }
+
+    v2 = params.voltage * params.voltage
+    half = 0.5 * 1.0e-15  # fF -> F, and the 1/2 in 1/2 C V^2 per transition
+    energy_j = 0.0
+    nets: list[NetPower] = []
+    total_toggles = 0
+    # Accumulate in sorted-name order: float addition is non-associative, and toggles is
+    # keyed off the (id-hash-ordered) wire set, so an unsorted sum would vary by ULPs across
+    # runs even though the toggle COUNTS are identical — breaking reproducible power numbers.
+    for name, tog in sorted(toggles.items()):
+        total_toggles += tog
+        if tog == 0:
+            continue
+        w = wires_by_name.get(name)
+        if w is None or isinstance(w, Const):
+            continue
+        fo = fanout_of.get(w, 0)
+        cap_bit_ff = params.cap_wire_ff + params.cap_fanout_ff * fo
+        e = half * cap_bit_ff * v2 * tog  # joules switched by this net over the trace
+        energy_j += e
+        bw = w.bitwidth or 1
+        nets.append(
+            NetPower(
+                name=name,
+                bitwidth=bw,
+                fanout=fo,
+                toggles=tog,
+                activity=tog / cycles,
+                power_w=e * params.frequency_hz / cycles,
+            )
+        )
+
+    data_power_w = energy_j * params.frequency_hz / cycles
+
+    # clock tree: every register bit's clock pin charges/discharges once per cycle
+    register_bits = sum(
+        (w.bitwidth or 1) for w in block.wirevector_subset(Register)
+    )
+    clock_power_w = (
+        register_bits * (params.cap_clock_ff * 1.0e-15) * v2 * params.frequency_hz
     )
 
-
-def estimate_streaming_dynamic_power(
-    trace: StreamingToggleTrace,
-    block=None,
-    params: PowerParams | None = None,
-    top_k: int = 10,
-) -> PowerEstimate:
-    """Estimate power from an exact bounded-memory streaming toggle trace."""
-
-    if not isinstance(trace, StreamingToggleTrace):
-        raise PyrtlError("expected a StreamingToggleTrace")
-    params = params or PowerParams()
-    block = block or trace.block or working_block()
-    return _estimate_from_toggles(
-        toggles=trace.toggle_counts,
-        cycles=trace.cycles,
-        wires_by_name=trace._wires,
-        block=block,
+    nets.sort(key=lambda n: n.power_w, reverse=True)
+    return PowerEstimate(
+        dynamic_power_w=data_power_w + clock_power_w,
+        data_switching_power_w=data_power_w,
+        clock_power_w=clock_power_w,
+        switching_energy_j=energy_j,
+        cycles=cycles,
+        total_toggles=total_toggles,
+        register_bits=register_bits,
         params=params,
-        top_k=top_k,
+        dominant_nets=nets[:top_k],
     )
 
 

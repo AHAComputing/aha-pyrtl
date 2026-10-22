@@ -16,7 +16,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import textwrap
 from typing import IO, TYPE_CHECKING
 
 from pyrtl.core import Block, _NameSanitizer, working_block
@@ -829,29 +828,26 @@ class _VerilogOutput:
 
         self.registers = self._name_sorted(self.gate_graph.registers)
 
-        # List of all unique MemBlocks and RomBlocks, sorted by stable source
-        # name.  Memory ids encode allocation order; hierarchy flattening may
-        # legitimately allocate equivalent replicas in a different order, so
-        # sorting by id makes otherwise identical RTL byte-nondeterministic.
+        # List of all unique MemBlocks and RomBlocks, sorted by memid.
         self.all_memblocks = sorted(
             # Build a set of unique MemBlocks first, to avoid duplicates.
             {
                 mem_gate.op_param[1]
                 for mem_gate in self.gate_graph.mem_reads | self.gate_graph.mem_writes
             },
-            key=lambda memblock: memblock.name,
+            key=lambda memblock: memblock.id,
         )
 
         # Sanitize all MemBlock names.
         for memblock in self.all_memblocks:
             self.internal_names.make_valid_string(memblock.name)
 
-        # List of unique MemBlocks (not RomBlocks!), sorted by name.
+        # List of unique MemBlocks (not RomBlocks!), sorted by memid.
         self.memblocks = [
             memblock for memblock in self.all_memblocks if type(memblock) is MemBlock
         ]
 
-        # List of unique RomBlocks (not MemBlocks!), sorted by name.
+        # List of unique RomBlocks (not MemBlocks!), sorted by memid.
         self.romblocks = [
             romblock
             for romblock in self.all_memblocks
@@ -932,22 +928,14 @@ class _VerilogOutput:
         4. ``Gates`` that are ``args`` for a ``s`` bit-selection ``Gate``, because
            Verilog's bit-selection operator ``[]`` only works on wires and registers,
            not arbitrary expressions.
-
-        5. Arithmetic ``Gates``. Their declared result width is a semantic
-           boundary: Verilog self-sizes inline concat operands and propagates
-           enclosing expression widths through arithmetic. A sized wire retains
-           the PyRTL carry, borrow and full product before either can happen.
         """
         excluded = gate.is_output or gate.op in "ICr@"
         is_named = gate.name and not gate.name.startswith("tmp")
         multiple_users = len(gate.dests) > 1
         is_read = gate.op == "m"
         is_sliced = self._is_sliced(gate)
-        is_arithmetic = gate.op in ("+", "-", "*")
 
-        return not excluded and (
-            is_named or multiple_users or is_read or is_sliced or is_arithmetic
-        )
+        return not excluded and (is_named or multiple_users or is_read or is_sliced)
 
     def _name_and_comment(self, name: str, kind="") -> tuple[str, str]:
         """Return the sanitized version of ``name`` and a Verilog comment with the
@@ -1182,24 +1170,11 @@ class _VerilogOutput:
         if self.combinational_gates:
             print("\n    // Combinational logic", file=file)
         for assignment_gate in self._name_sorted(self.combinational_gates):
-            statement = (
+            print(
                 f"    assign {self._verilog_name(assignment_gate.name)} = "
-                f"{self._verilog_expr(assignment_gate, lhs=assignment_gate)};"
+                f"{self._verilog_expr(assignment_gate, lhs=assignment_gate)};",
+                file=file,
             )
-            self._write_verilog_statement(statement, file)
-
-    @staticmethod
-    def _write_verilog_statement(statement: str, file: IO):
-        # Wrap only at existing whitespace: preserve every Verilog token while
-        # staying below Verilator's per-physical-line preprocessor token limit.
-        for line in textwrap.wrap(
-            statement,
-            width=12000,
-            subsequent_indent="        ",
-            break_long_words=False,
-            break_on_hyphens=False,
-        ):
-            print(line, file=file)
 
     def _to_verilog_sequential(self, file: IO):
         """Print the sequential logic of the verilog implementation."""
@@ -1226,10 +1201,10 @@ class _VerilogOutput:
             indent = ""
 
         for register in self._name_sorted(self.gate_graph.registers):
-            self._write_verilog_statement(
+            print(
                 f"        {indent}{self._verilog_name(register.name)} <= "
                 f"{self._verilog_expr(register.args[0])};",
-                file,
+                file=file,
             )
         if self.add_reset:
             print("        end", file=file)

@@ -143,17 +143,7 @@ def emit_blackbox_stub(macro: HardMacro) -> str:
     """A ``(* blackbox *) module ...; endmodule`` stub so the design elaborates with the
     macro unresolved (yosys treats it as a black box; the vendor library supplies the real
     one downstream)."""
-    lines = ["(* blackbox *)"]
-    if macro.parameters:
-        lines.append(f"module {macro.module} #(")
-        params = [
-            f"    parameter {name} = {_param_to_verilog(value)}"
-            for name, value in macro.parameters.items()
-        ]
-        lines.append(",\n".join(params))
-        lines.append(") (")
-    else:
-        lines.append(f"module {macro.module} (")
+    lines = ["(* blackbox *)", f"module {macro.module} ("]
     decls = []
     for p in macro.ports:
         rng = f"[{p.width - 1}:0] " if p.width and p.width > 1 else ""
@@ -202,31 +192,6 @@ def _require_model(macro: HardMacro) -> None:
         raise ValueError(
             f"macro {macro.module!r} has no sim_model — it is a black box (emit-only); "
             "attach a sim_model to simulate or prove it")
-
-
-def _model_memory_name(module: str) -> str:
-    """Return a deterministic, block-local name for behavioral macro storage.
-
-    A single :class:`HardMacro` object can be modeled many times in one flat
-    PyRTL block.  Reusing ``<module>_arr`` for every model aliases the emitted
-    Verilog identifiers even though the PyRTL memories have distinct IDs.
-    Preserve the legacy name for the first instance and suffix later replicas.
-    The counter lives on the working block, so separate and concurrent builds
-    remain isolated and deterministic.
-    """
-    import pyrtl
-
-    block = pyrtl.working_block()
-    attribute = "_hardip_model_memory_counts"
-    counts = getattr(block, attribute, None)
-    if counts is None:
-        counts = {}
-        setattr(block, attribute, counts)
-    replica = counts.get(module, 0)
-    counts[module] = replica + 1
-    if replica == 0:
-        return f"{module}_arr"
-    return f"{module}_model{replica}_arr"
 
 
 def instantiate_model(macro: HardMacro, inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -308,11 +273,7 @@ def foundry_sram_1rw(module: str, depth: int, width: int, *, vendor: str = "foun
     def _model(inputs):
         import pyrtl
 
-        # The generic interface's Q port is an asynchronous read; callers add an explicit
-        # output register when targeting a synchronous compiler macro.  Keep the behavioral
-        # model aligned with that documented contract and allow a decoded/muxed 1RW address.
-        mem = pyrtl.MemBlock(
-            bitwidth=width, addrwidth=aw, name=_model_memory_name(module), asynchronous=True)
+        mem = pyrtl.MemBlock(bitwidth=width, addrwidth=aw, name=f"{module}_arr")
         mem[inputs["A"]] <<= pyrtl.MemBlock.EnabledWrite(
             inputs["D"], enable=inputs["WE"] & inputs["CE"])
         return {"Q": mem[inputs["A"]]}
@@ -327,183 +288,6 @@ def foundry_sram_1rw(module: str, depth: int, width: int, *, vendor: str = "foun
             MacroPort("CE", "input"),
             MacroPort("WE", "input"),
             MacroPort("A", "input", aw),
-            MacroPort("D", "input", width),
-            MacroPort("Q", "output", width),
-        ),
-    )
-
-
-def foundry_sram_1rw_byte_masked(
-    module: str,
-    depth: int,
-    width: int,
-    *,
-    vendor: str = "foundry",
-) -> HardMacro:
-    """Single-port SRAM-compiler macro with one write enable per byte.
-
-    ``WEM[byte]`` updates byte lane ``byte`` on ``CE & WE``.  The storage
-    remains an explicit foundry boundary; the byte-array model only supplies
-    bit-exact simulation/proof behavior for the declared macro contract.
-    """
-    if width < 8 or width % 8:
-        raise ValueError("byte-masked SRAM width must be a positive byte multiple")
-    aw = max((depth - 1).bit_length(), 1)
-    byte_count = width // 8
-
-    def _model(inputs):
-        import pyrtl
-
-        mem = pyrtl.MemBlock(
-            bitwidth=width,
-            addrwidth=aw,
-            name=_model_memory_name(module),
-            asynchronous=True,
-            max_read_ports=1,
-            max_write_ports=1,
-        )
-        old = mem[inputs["A"]]
-        lanes = []
-        for byte in range(byte_count):
-            lanes.append(
-                pyrtl.select(
-                    inputs["WEM"][byte],
-                    truecase=inputs["D"][byte * 8:(byte + 1) * 8],
-                    falsecase=old[byte * 8:(byte + 1) * 8],
-                )
-            )
-        merged = pyrtl.concat(*reversed(lanes))
-        mem[inputs["A"]] <<= pyrtl.MemBlock.EnabledWrite(
-            merged,
-            enable=inputs["CE"] & inputs["WE"],
-        )
-        return {"Q": old}
-
-    return HardMacro(
-        module=module,
-        vendor=vendor,
-        parameters={"DEPTH": depth, "WIDTH": width, "MASK_WIDTH": byte_count},
-        sim_model=_model,
-        ports=(
-            MacroPort("CLK", "input", is_clock=True),
-            MacroPort("CE", "input"),
-            MacroPort("WE", "input"),
-            MacroPort("WEM", "input", byte_count),
-            MacroPort("A", "input", aw),
-            MacroPort("D", "input", width),
-            MacroPort("Q", "output", width),
-        ),
-    )
-
-
-def foundry_sram_1rw_byte_masked_registered_read(
-    module: str,
-    depth: int,
-    width: int,
-    *,
-    vendor: str = "foundry",
-) -> HardMacro:
-    """Byte-masked 1RW SRAM with a one-cycle, clock-enabled read output.
-
-    On ``CE``, ``Q`` captures the pre-write contents of ``A`` at the rising
-    edge.  A simultaneous masked write commits at that edge, so read-during-
-    write is explicitly old-data.  When ``CE`` is low, ``Q`` holds.
-    """
-    if width < 8 or width % 8:
-        raise ValueError("byte-masked SRAM width must be a positive byte multiple")
-    aw = max((depth - 1).bit_length(), 1)
-    byte_count = width // 8
-
-    def _model(inputs):
-        import pyrtl
-
-        mem = pyrtl.MemBlock(
-            bitwidth=width,
-            addrwidth=aw,
-            name=_model_memory_name(module),
-            asynchronous=True,
-            max_read_ports=1,
-            max_write_ports=1,
-        )
-        old = mem[inputs["A"]]
-        q = pyrtl.Register(width, f"{module}_registered_q", reset_value=0)
-        q.next <<= pyrtl.select(inputs["CE"], truecase=old, falsecase=q)
-        lanes = []
-        for byte in range(byte_count):
-            lanes.append(
-                pyrtl.select(
-                    inputs["WEM"][byte],
-                    truecase=inputs["D"][byte * 8:(byte + 1) * 8],
-                    falsecase=old[byte * 8:(byte + 1) * 8],
-                )
-            )
-        merged = pyrtl.concat(*reversed(lanes))
-        mem[inputs["A"]] <<= pyrtl.MemBlock.EnabledWrite(
-            merged,
-            enable=inputs["CE"] & inputs["WE"],
-        )
-        return {"Q": q}
-
-    return HardMacro(
-        module=module,
-        vendor=vendor,
-        parameters={"DEPTH": depth, "WIDTH": width, "MASK_WIDTH": byte_count},
-        sim_model=_model,
-        ports=(
-            MacroPort("CLK", "input", is_clock=True),
-            MacroPort("CE", "input"),
-            MacroPort("WE", "input"),
-            MacroPort("WEM", "input", byte_count),
-            MacroPort("A", "input", aw),
-            MacroPort("D", "input", width),
-            MacroPort("Q", "output", width),
-        ),
-    )
-
-
-def foundry_sram_1r1w(
-    module: str,
-    depth: int,
-    width: int,
-    *,
-    vendor: str = "foundry",
-) -> HardMacro:
-    """A one-read/one-write SRAM macro with independent addresses.
-
-    The behavioral contract is asynchronous read plus synchronous write.  It
-    deliberately models one physical write port; callers that need multiple
-    architectural writes must bank/arbitrate before the macro boundary.
-    """
-    aw = max((depth - 1).bit_length(), 1)
-
-    def _model(inputs):
-        import pyrtl
-
-        mem = pyrtl.MemBlock(
-            bitwidth=width,
-            addrwidth=aw,
-            name=_model_memory_name(module),
-            asynchronous=True,
-            max_read_ports=1,
-            max_write_ports=1,
-        )
-        mem[inputs["WA"]] <<= pyrtl.MemBlock.EnabledWrite(
-            inputs["D"],
-            enable=inputs["WE"] & inputs["CE"],
-        )
-        return {"Q": mem[inputs["RA"]]}
-
-    return HardMacro(
-        module=module,
-        vendor=vendor,
-        parameters={"DEPTH": depth, "WIDTH": width},
-        sim_model=_model,
-        ports=(
-            MacroPort("CLK", "input", is_clock=True),
-            MacroPort("CE", "input"),
-            MacroPort("WE", "input"),
-            MacroPort("RA", "input", aw),
-            MacroPort("WA", "input", aw),
             MacroPort("D", "input", width),
             MacroPort("Q", "output", width),
         ),
@@ -667,7 +451,5 @@ __all__ = [
     "emit_blackbox_stub", "render_instance", "render_array", "collect_blackbox_stubs",
     "instantiate_model", "build_model_block", "simulate_macro", "macro_model_equivalent",
     "MacroModelCertificate", "wire_macro_model",
-    "foundry_sram_1rw", "foundry_sram_1rw_byte_masked",
-    "foundry_sram_1rw_byte_masked_registered_read", "foundry_sram_1r1w",
-    "xilinx_ramb36e2", "xilinx_dsp48e2", "xilinx_bufg", "aha_efpga_region",
+    "foundry_sram_1rw", "xilinx_ramb36e2", "xilinx_dsp48e2", "xilinx_bufg", "aha_efpga_region",
 ]

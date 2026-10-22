@@ -606,7 +606,6 @@ class FastSimulation:
         tracer: SimulationTrace = True,
         block: Block = None,
         code_file: str | None = None,
-        skip_sanity_check: bool = False,
     ):
         """
         The interfaces for ``FastSimulation`` and :class:`Simulation` are nearly
@@ -625,11 +624,6 @@ class FastSimulation:
 
         :param code_file: The name of the file in which to store a copy of the generated
             Python code. By default, the generated code is not saved.
-
-        :param skip_sanity_check: Skip the constructor's block sanity check. This is
-            intended only for a block that the caller has just validated, such as the
-            result of :meth:`pyrtl.hierarchy.Design.flatten`, which already runs the
-            same check. The default remains fail-closed.
         """
 
         if memory_value_map is None:
@@ -637,8 +631,7 @@ class FastSimulation:
         if register_value_map is None:
             register_value_map = {}
         block = working_block(block)
-        if not skip_sanity_check:
-            block.sanity_check()  # check that this is a good hw block
+        block.sanity_check()  # check that this is a good hw block
 
         self.block = block
         self.default_value = default_value

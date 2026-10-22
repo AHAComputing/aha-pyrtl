@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from .bundle import Decoupled, DecoupledWires
-from .util import arbiter, round_robin_arbiter
+from .util import arbiter
 
 
 @dataclass(frozen=True)
@@ -86,8 +86,8 @@ def build_decoder(addr, amap: AddressMap):
         in_range = (~(a < pyrtl.Const(base, aw1))) & (a < pyrtl.Const(base + size, aw1))
         sels.append(in_range)
     hit = sels[0]
-    for select in sels[1:]:
-        hit = hit | select
+    for s in sels[1:]:
+        hit = hit | s
     return sels, hit
 
 
@@ -106,201 +106,31 @@ def route(master: DecoupledWires, addr, amap: AddressMap, *, name: str = "rt") -
         br.valid <<= master.valid & sels[s]
         branches.append(br)
     ready = sels[0] & branches[0].ready
-    for index in range(1, amap.n):
-        ready = ready | (sels[index] & branches[index].ready)
+    for s in range(1, amap.n):
+        ready = ready | (sels[s] & branches[s].ready)
     master.ready <<= ready                                # ready of the addressed slave (one-hot)
     return branches
 
 
 def crossbar(masters: List[DecoupledWires], addrs: List, amap: AddressMap,
-             *, name: str = "xbar",
-             arbitration: str = "fixed_priority") -> List[DecoupledWires]:
+             *, name: str = "xbar") -> List[DecoupledWires]:
     """N->M request crossbar: each master is routed by its address, and each slave arbitrates the
     masters contending for it. Returns the M slave channels. Composed from :func:`route` (demux)
     and :func:`arbiter` (per-slave merge). See :func:`crossbar_full` for the bidirectional version
     (response routing back to the originating master)."""
     if len(masters) != len(addrs):
         raise ValueError("one address wire per master")
-    if arbitration not in {"fixed_priority", "round_robin"}:
-        raise ValueError(
-            "arbitration must be fixed_priority or round_robin")
-    merge = arbiter if arbitration == "fixed_priority" else round_robin_arbiter
     per_master = [route(m, a, amap, name=f"{name}_m{i}")
                   for i, (m, a) in enumerate(zip(masters, addrs))]
     slaves: List[DecoupledWires] = []
     for s in range(amap.n):
         contenders = [per_master[i][s] for i in range(len(masters))]
-        slaves.append(merge(contenders, name=f"{name}_s{s}"))
+        slaves.append(arbiter(contenders, name=f"{name}_s{s}"))
     return slaves
 
 
-def crossbar_selected(
-        masters: List[DecoupledWires],
-        selections: List[List],
-        *,
-        name: str = "xbar_selected",
-        arbitration: str = "fixed_priority",
-) -> List[DecoupledWires]:
-    """N->M crossbar driven by registered one-hot selections.
-
-    ``selections[master][target]`` is the route bit for one request. A row may
-    be all-zero for an unmapped request. This form lets address decoding live
-    in an earlier pipeline stage without reconstructing an address.
-    """
-    import pyrtl
-
-    if not masters:
-        raise ValueError("selected crossbar needs at least one master")
-    if len(selections) != len(masters):
-        raise ValueError("one selection row per master")
-    targets = len(selections[0])
-    if targets < 1 or any(len(row) != targets for row in selections):
-        raise ValueError("selected crossbar rows must have equal nonzero width")
-    if arbitration not in {"fixed_priority", "round_robin"}:
-        raise ValueError(
-            "arbitration must be fixed_priority or round_robin")
-    merge = arbiter if arbitration == "fixed_priority" else round_robin_arbiter
-
-    branches = []
-    for master_index, (master, row) in enumerate(
-            zip(masters, selections)):
-        per_target = []
-        ready_terms = []
-        for target_index, selected in enumerate(row):
-            branch = Decoupled(len(master.bits)).wires(
-                f"{name}_m{master_index}_s{target_index}_")
-            branch.bits <<= master.bits
-            branch.valid <<= master.valid & selected
-            per_target.append(branch)
-            ready_terms.append(selected & branch.ready)
-        ready = ready_terms[0]
-        for term in ready_terms[1:]:
-            ready = ready | term
-        master.ready <<= ready
-        branches.append(per_target)
-
-    return [
-        merge(
-            [branches[master][target] for master in range(len(masters))],
-            name=f"{name}_s{target}")
-        for target in range(targets)
-    ]
-
-
-def crossbar_full_selected(
-        masters: List[DecoupledWires],
-        request_selections: List[List],
-        slave_resps: List[DecoupledWires],
-        *,
-        resp_width: int,
-        name: str = "xbar_selected",
-        arbitration: str = "fixed_priority",
-):
-    """Bidirectional crossbar with predecoded request selections."""
-    import pyrtl
-
-    n = len(masters)
-    if n < 1 or len(request_selections) != n:
-        raise ValueError("one request selection row per master")
-    targets = len(request_selections[0])
-    if len(slave_resps) != targets:
-        raise ValueError("one response channel per selected target")
-    idw = max((n - 1).bit_length(), 1)
-    request_width = len(masters[0].bits)
-    tagged = []
-    for master_index, master in enumerate(masters):
-        channel = Decoupled(idw + request_width).wires(
-            f"{name}_tag{master_index}_")
-        channel.bits <<= pyrtl.concat(
-            pyrtl.Const(master_index, idw), master.bits)
-        channel.valid <<= master.valid
-        master.ready <<= channel.ready
-        tagged.append(channel)
-    slave_requests = crossbar_selected(
-        tagged,
-        request_selections,
-        name=f"{name}_req",
-        arbitration=arbitration,
-    )
-
-    response_selections = []
-    for response in slave_resps:
-        source_id = response.bits[resp_width:resp_width + idw]
-        response_selections.append([
-            source_id == pyrtl.Const(master_index, idw)
-            for master_index in range(n)
-        ])
-    routed = crossbar_selected(
-        slave_resps,
-        response_selections,
-        name=f"{name}_resp",
-        arbitration=arbitration,
-    )
-    master_responses = []
-    for master_index, routed_response in enumerate(routed):
-        response = Decoupled(resp_width).wires(
-            f"{name}_mresp{master_index}_")
-        response.bits <<= routed_response.bits[0:resp_width]
-        response.valid <<= routed_response.valid
-        routed_response.ready <<= response.ready
-        master_responses.append(response)
-    return slave_requests, master_responses
-
-
-def crossbar_full_preselected(
-        masters: List[DecoupledWires],
-        request_selections: List[List],
-        slave_responses: List[DecoupledWires],
-        response_selections: List[List],
-        *,
-        name: str = "xbar_preselected",
-        arbitration: str = "fixed_priority",
-):
-    """Bidirectional crossbar with predecoded routes in both directions.
-
-    Request payloads are source-tagged for the target protocol. Response
-    channels contain payload only; their separately registered selection rows
-    identify the originating master.
-    """
-    import pyrtl
-
-    n = len(masters)
-    if n < 1 or len(request_selections) != n:
-        raise ValueError("one request selection row per master")
-    targets = len(request_selections[0])
-    if (
-            len(slave_responses) != targets
-            or len(response_selections) != targets):
-        raise ValueError("one response and selection row per target")
-    idw = max((n - 1).bit_length(), 1)
-    request_width = len(masters[0].bits)
-    tagged = []
-    for master_index, master in enumerate(masters):
-        channel = Decoupled(idw + request_width).wires(
-            f"{name}_tag{master_index}_")
-        channel.bits <<= pyrtl.concat(
-            pyrtl.Const(master_index, idw), master.bits)
-        channel.valid <<= master.valid
-        master.ready <<= channel.ready
-        tagged.append(channel)
-    slave_requests = crossbar_selected(
-        tagged,
-        request_selections,
-        name=f"{name}_req",
-        arbitration=arbitration,
-    )
-    master_responses = crossbar_selected(
-        slave_responses,
-        response_selections,
-        name=f"{name}_resp",
-        arbitration=arbitration,
-    )
-    return slave_requests, master_responses
-
-
 def crossbar_full(masters: List[DecoupledWires], addrs: List, slave_resps: List[DecoupledWires],
-                  amap: AddressMap, *, resp_width: int, name: str = "xbar",
-                  arbitration: str = "fixed_priority"):
+                  amap: AddressMap, *, resp_width: int, name: str = "xbar"):
     """A full bidirectional N<->M crossbar. The request path routes each master to the addressed
     slave (by address) and tags the request with the master's source id; the slave is expected to
     ECHO that id in its response; the RESPONSE path is then just another crossbar routed by the id
@@ -332,17 +162,13 @@ def crossbar_full(masters: List[DecoupledWires], addrs: List, slave_resps: List[
         t.valid <<= masters[m].valid
         masters[m].ready <<= t.ready
         tagged.append(t)
-    slave_reqs = crossbar(
-        tagged, addrs, amap, name=f"{name}_req",
-        arbitration=arbitration)
+    slave_reqs = crossbar(tagged, addrs, amap, name=f"{name}_req")
 
     # response: route each slave response back to master[id] (id == the echoed source) via a
     # crossbar over an identity id-map (master i occupies id range [i, i+1))
     id_amap = AddressMap(tuple((f"m{i}", i, 1) for i in range(n)), addrwidth=idw)
     resp_ids = [sr.bits[resp_width:resp_width + idw] for sr in slave_resps]
-    routed = crossbar(
-        slave_resps, resp_ids, id_amap, name=f"{name}_resp",
-        arbitration=arbitration)
+    routed = crossbar(slave_resps, resp_ids, id_amap, name=f"{name}_resp")
 
     master_resps = []
     for m in range(n):
@@ -356,7 +182,5 @@ def crossbar_full(masters: List[DecoupledWires], addrs: List, slave_resps: List[
 
 __all__ = [
     "AddressMap", "MapViolation", "address_map_violations", "map_clean",
-    "build_decoder", "route", "crossbar", "crossbar_selected",
-    "crossbar_full", "crossbar_full_selected",
-    "crossbar_full_preselected",
+    "build_decoder", "route", "crossbar", "crossbar_full",
 ]

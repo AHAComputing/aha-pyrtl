@@ -19,14 +19,7 @@ from typing import List
 from .bundle import Decoupled, DecoupledWires
 
 
-def queue(
-    enq: DecoupledWires,
-    depth: int,
-    *,
-    name: str = "q",
-    clear=None,
-    allow_full_replacement: bool = True,
-) -> DecoupledWires:
+def queue(enq: DecoupledWires, depth: int, *, name: str = "q") -> DecoupledWires:
     """A synchronous FIFO of ``depth`` entries. ``enq`` is the enqueue channel (the producer
     drives ``enq.bits``/``enq.valid``; this drives ``enq.ready``). Returns the dequeue channel
     (this drives ``deq.bits``/``deq.valid``; the consumer drives ``deq.ready``). Circular buffer
@@ -47,36 +40,20 @@ def queue(
 
     full = count == depth
     empty = count == 0
+    enq.ready <<= ~full
     deq.valid <<= ~empty
     deq.bits <<= mem[head]                            # async read of the oldest entry
-    # A simultaneous dequeue can normally free the head slot at the same edge.
-    # Some compositions deliberately disable this bypass to cut a ready/valid
-    # combinational cycle at an arbitration boundary.
-    if allow_full_replacement:
-        enq.ready <<= ~full | (deq.ready & ~empty)
-    else:
-        enq.ready <<= ~full
 
-    do_enq = enq.valid & enq.ready
+    do_enq = enq.valid & ~full
     do_deq = deq.ready & ~empty
     mem[tail] <<= pyrtl.MemBlock.EnabledWrite(enq.bits, enable=do_enq)
 
     def _adv(ptr):                                    # wrap depth-1 -> 0
         return pyrtl.select(ptr == (depth - 1), pyrtl.Const(0, aw), (ptr + 1)[0:aw])
 
-    next_tail = pyrtl.select(do_enq, _adv(tail), tail)
-    next_head = pyrtl.select(do_deq, _adv(head), head)
-    next_count = (
-        count + do_enq.zero_extended(cw) - do_deq.zero_extended(cw)
-    )[0:cw]
-    if clear is None:
-        tail.next <<= next_tail
-        head.next <<= next_head
-        count.next <<= next_count
-    else:
-        tail.next <<= pyrtl.select(clear, pyrtl.Const(0, aw), next_tail)
-        head.next <<= pyrtl.select(clear, pyrtl.Const(0, aw), next_head)
-        count.next <<= pyrtl.select(clear, pyrtl.Const(0, cw), next_count)
+    tail.next <<= pyrtl.select(do_enq, _adv(tail), tail)
+    head.next <<= pyrtl.select(do_deq, _adv(head), head)
+    count.next <<= (count + do_enq.zero_extended(cw) - do_deq.zero_extended(cw))[0:cw]
     return deq
 
 

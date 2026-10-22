@@ -148,10 +148,8 @@ from .power import (
     PowerParams,
     PowerEstimate,
     NetPower,
-    StreamingToggleTrace,
     count_toggles,
     estimate_dynamic_power,
-    estimate_streaming_dynamic_power,
     simulate_and_estimate_power,
 )
 
@@ -169,8 +167,7 @@ from .util import queue, arbiter, round_robin_arbiter
 # AHA fork: address-map interconnect generation (SoC crossbar)
 from .interconnect import (
     AddressMap, MapViolation, address_map_violations, map_clean,
-    build_decoder, route, crossbar, crossbar_selected,
-    crossbar_full, crossbar_full_selected, crossbar_full_preselected,
+    build_decoder, route, crossbar, crossbar_full,
 )
 
 # AHA fork: realistic multi-port / banked SRAM modeling (additive; not in upstream)
@@ -316,10 +313,8 @@ __all__ = [
     "PowerParams",
     "PowerEstimate",
     "NetPower",
-    "StreamingToggleTrace",
     "count_toggles",
     "estimate_dynamic_power",
-    "estimate_streaming_dynamic_power",
     "simulate_and_estimate_power",
     # typed aggregates + decoupled (AHA fork)
     "Bundle",
@@ -336,10 +331,7 @@ __all__ = [
     "build_decoder",
     "route",
     "crossbar",
-    "crossbar_selected",
     "crossbar_full",
-    "crossbar_full_selected",
-    "crossbar_full_preselected",
     # sram (AHA fork)
     "SramConfig",
     "SramPPA",
